@@ -472,6 +472,10 @@ function repairToolCallJson(input: string, log: ReturnType<typeof Log.create>, t
     return undefined
   } catch {}
 
+  // Only attempt repair if the input looks like it was intended as JSON
+  const trimmed = input.trimStart()
+  if (!trimmed.startsWith("{") && !trimmed.startsWith("[") && !trimmed.startsWith("`")) return undefined
+
   let repaired = input
 
   // Strategy 1: Handle duplicated/overlapping JSON objects (specific case we observed)
