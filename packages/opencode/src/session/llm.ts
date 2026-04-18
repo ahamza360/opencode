@@ -2,7 +2,7 @@ import { Provider } from "@/provider"
 import { Log } from "@/util"
 import { Context, Effect, Layer, Record } from "effect"
 import * as Stream from "effect/Stream"
-import { streamText, wrapLanguageModel, type ModelMessage, type Tool, tool, jsonSchema } from "ai"
+import { streamText, wrapLanguageModel, type ModelMessage, type Tool, tool, jsonSchema, InvalidToolInputError, NoSuchToolError } from "ai"
 import { mergeDeep, pipe } from "remeda"
 import { GitLabWorkflowLanguageModel } from "gitlab-ai-provider"
 import { ProviderTransform } from "@/provider"
@@ -337,40 +337,9 @@ const live: Layer.Layer<
           })
         },
         async experimental_repairToolCall(failed) {
-          const lower = failed.toolCall.toolName.toLowerCase()
-          if (lower !== failed.toolCall.toolName && tools[lower]) {
-            l.info("repairing tool call", {
-              tool: failed.toolCall.toolName,
-              repaired: lower,
-            })
-            return {
-              ...failed.toolCall,
-              toolName: lower,
-            }
-          }
-
-          // Attempt JSON repair for malformed/truncated tool call arguments
-          if (failed.error.message?.includes("JSON")) {
-            const repaired = repairToolCallJson(failed.toolCall.input, l, failed.toolCall.toolName)
-            if (repaired !== undefined) {
-              l.info("repaired malformed tool call JSON", {
-                tool: failed.toolCall.toolName,
-              })
-              return {
-                ...failed.toolCall,
-                input: repaired,
-              }
-            }
-          }
-          
-          return {
-            ...failed.toolCall,
-            input: JSON.stringify({
-              tool: failed.toolCall.toolName,
-              error: failed.error.message,
-            }),
-            toolName: "invalid",
-          }
+          const result = repairToolCall(failed, tools, l)
+          l.info("repairToolCall result", { tool: result.toolName })
+          return result
         },
         temperature: params.temperature,
         topP: params.topP,
@@ -463,6 +432,89 @@ function resolveTools(input: Pick<StreamInput, "tools" | "agent" | "permission" 
     Permission.merge(input.agent.permission, input.permission ?? []),
   )
   return Record.filter(input.tools, (_, k) => input.user.tools?.[k] !== false && !disabled.has(k))
+}
+
+function normalizeFilePath(input: Record<string, unknown>, toolName: string): string | null {
+  const lower = toolName.toLowerCase()
+  if (!["write", "read", "edit", "multiedit", "lsp"].includes(lower)) return null
+  if (typeof input.filePath === "string" && input.filePath.trim()) return null
+  const filePath = [input.filepath, input.path, input.file, input.filename]
+    .map((v) => (typeof v === "string" ? v.trim() : undefined))
+    .find((x) => x)
+  if (!filePath) return null
+  const fixed: Record<string, unknown> = { ...input, filePath }
+  delete fixed.filepath
+  if (lower === "write") delete fixed.path
+  delete fixed.file
+  delete fixed.filename
+  return JSON.stringify(fixed)
+}
+
+function repairToolCall(
+  failed: {
+    toolCall: { type: "tool-call"; toolName: string; input: string; toolCallId: string }
+    error: Error
+  },
+  tools: Record<string, unknown>,
+  log: ReturnType<typeof Log.create>,
+) {
+  const name = failed.toolCall.toolName
+  const lower = name.toLowerCase()
+
+  if (lower !== name && tools[lower]) {
+    log.info("repairing tool call", { tool: name, repaired: lower })
+    return { ...failed.toolCall, toolName: lower }
+  }
+
+  const resolvedName = tools[lower] ? lower : name
+  const isInvalidInput = InvalidToolInputError.isInstance(failed.error)
+  const hasJsonError =
+    isInvalidInput ||
+    (failed.error?.message &&
+      (failed.error.message.includes("JSON") ||
+        failed.error.message.includes("parse") ||
+        failed.error.message.includes("Unterminated")))
+
+  if (hasJsonError && tools[resolvedName]) {
+    const toolInput = isInvalidInput ? (failed.error as InvalidToolInputError).toolInput : failed.toolCall.input
+    const repaired = repairToolCallJson(toolInput, log, resolvedName)
+    if (repaired !== undefined) {
+      try {
+        const parsed = JSON.parse(repaired)
+        if (typeof parsed === "object" && parsed !== null) {
+          const normalized = normalizeFilePath(parsed, resolvedName)
+          if (normalized) {
+            log.info("normalized filePath for tool", { tool: resolvedName })
+            return { ...failed.toolCall, toolName: resolvedName, input: normalized }
+          }
+        }
+      } catch {}
+      log.info("repaired malformed tool call JSON", { tool: resolvedName })
+      return { ...failed.toolCall, toolName: resolvedName, input: repaired }
+    }
+
+    try {
+      const parsed = JSON.parse(toolInput)
+      if (typeof parsed === "object" && parsed !== null) {
+        const normalized = normalizeFilePath(parsed, resolvedName)
+        if (normalized) {
+          log.info("normalized filePath for tool", { tool: resolvedName })
+          return { ...failed.toolCall, toolName: resolvedName, input: normalized }
+        }
+      }
+    } catch {}
+  }
+
+  const isNoSuchTool = NoSuchToolError.isInstance(failed.error)
+  const msg = isNoSuchTool
+    ? `Tool "${name}" is not available. Please use one of the tools provided to you.`
+    : `Tool "${name}" was called with invalid arguments. Please review the tool schema and retry.`
+
+  return {
+    ...failed.toolCall,
+    input: JSON.stringify({ tool: name, error: msg }),
+    toolName: "invalid",
+  }
 }
 
 function repairToolCallJson(input: string, log: ReturnType<typeof Log.create>, toolName: string): string | undefined {
@@ -563,5 +615,7 @@ export function hasToolCalls(messages: ModelMessage[]): boolean {
   }
   return false
 }
+
+export { repairToolCallJson, normalizeFilePath, repairToolCall }
 
 export * as LLM from "./llm"
