@@ -466,83 +466,86 @@ function resolveTools(input: Pick<StreamInput, "tools" | "agent" | "permission" 
 }
 
 function repairToolCallJson(input: string, log: ReturnType<typeof Log.create>, toolName: string): string | undefined {
-  // Already valid JSON
   try {
     JSON.parse(input)
     return undefined
   } catch {}
 
-  // Only attempt repair if the input looks like it was intended as JSON
   const trimmed = input.trimStart()
   if (!trimmed.startsWith("{") && !trimmed.startsWith("[") && !trimmed.startsWith("`")) return undefined
 
+  // Strategy 1: Find first complete JSON object (handles duplicated JSON)
+  let balance = 0
+  let inStr = false
+  let esc = false
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i]
+    if (esc) { esc = false; continue }
+    if (ch === "\\") { esc = true; continue }
+    if (ch === '"') { inStr = !inStr; continue }
+    if (inStr) continue
+    if (ch === "{" || ch === "[") balance++
+    else if (ch === "}" || ch === "]") balance--
+    if (balance === 0 && (ch === "}" || ch === "]")) {
+      const candidate = input.substring(0, i + 1)
+      try {
+        JSON.parse(candidate)
+        if (i < input.length - 1) {
+          log.info("repaired JSON by extracting first complete object", { tool: toolName })
+          return candidate
+        }
+      } catch {}
+    }
+  }
+
+  // Strategy 2: Duplicated JSON where first object is missing closing brace
+  // e.g. {"query":"x","max":10{"query":"x","max":10}
+  balance = 0
+  inStr = false
+  esc = false
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i]
+    if (esc) { esc = false; continue }
+    if (ch === "\\") { esc = true; continue }
+    if (ch === '"') { inStr = !inStr; continue }
+    if (inStr) continue
+    if (ch === "{" || ch === "[") {
+      balance++
+      if (balance === 2 && ch === "{") {
+        const candidate = input.substring(0, i) + "}"
+        try {
+          JSON.parse(candidate)
+          log.info("repaired JSON by closing duplicated object", { tool: toolName })
+          return candidate
+        } catch {}
+      }
+    }
+    if (ch === "}" || ch === "]") balance--
+  }
+
+  // Strategy 3: Truncated JSON — close unterminated strings and open brackets
   let repaired = input
-
-  // Strategy 1: Handle duplicated/overlapping JSON objects (specific case we observed)
-  // Look for valid JSON at the beginning and use only that part
-  let firstValidEnd = 0
-  for (let i = 1; i <= repaired.length; i++) {
-    try {
-      JSON.parse(repaired.substring(0, i))
-      firstValidEnd = i
-    } catch {
-      // Continue searching
-    }
-  }
-  
-  if (firstValidEnd > 0 && firstValidEnd < repaired.length) {
-    const firstObject = repaired.substring(0, firstValidEnd)
-    try {
-      JSON.parse(firstObject)
-      log.info("repaired duplicated JSON by taking first valid object", { tool: toolName })
-      return firstObject
-    } catch {
-      // If first object isn't valid, continue with other strategies
-    }
-  }
-
-  // Strategy 2: Fix overlapping objects pattern
-  // Pattern: {"key": "value","key2": value{... -> {"key": "value","key2": value}{...
-  const patternMatch = repaired.match(/^(\{[^}]*\}?)\{(.*)$/)
-  if (patternMatch) {
-    const firstPart = patternMatch[1] + '}'
-    try {
-      JSON.parse(firstPart)
-      log.info("repaired overlapping JSON objects", { tool: toolName })
-      return firstPart
-    } catch {
-      // Fall through to other strategies
-    }
-  }
-
-  // Strategy 3: Insert missing commas that might be causing issues
-  repaired = repaired.replace(/"(\s*)(\{|$$)/g, '"$1,$2')
-
-  // Try closing unterminated strings
-  if (!repaired.endsWith('"') && repaired.split('"').length % 2 === 0) {
-    repaired += '"'
-  }
-
-  // Count unmatched braces/brackets
-  const counts = { "{": 0, "[": 0 }
-  let inString = false
-  let escape = false
+  let esc2 = false
+  let inStr2 = false
+  const openStack: string[] = []
   for (const ch of repaired) {
-    if (escape) { escape = false; continue }
-    if (ch === "\\") { escape = true; continue }
-    if (ch === '"') { inString = !inString; continue }
-    if (inString) continue
-    if (ch === "{" || ch === "[") counts[ch]++
-    if (ch === "}" && counts["{"] > 0) counts["{"]--
-    if (ch === "]" && counts["["] > 0) counts["["]--
+    if (esc2) { esc2 = false; continue }
+    if (ch === "\\") { esc2 = true; continue }
+    if (ch === '"') { inStr2 = !inStr2; continue }
+    if (inStr2) continue
+    if (ch === "{" || ch === "[") openStack.push(ch)
+    if (ch === "}" && openStack.length > 0 && openStack[openStack.length - 1] === "{") openStack.pop()
+    if (ch === "]" && openStack.length > 0 && openStack[openStack.length - 1] === "[") openStack.pop()
   }
-
-  // Close open brackets in reverse order
-  if (counts["["] > 0) repaired += "]".repeat(counts["["])
-  if (counts["{"] > 0) repaired += "}".repeat(counts["{"])
+  if (inStr2) repaired += '"'
+  for (let i = openStack.length - 1; i >= 0; i--) {
+    repaired += openStack[i] === "{" ? "}" : "]"
+  }
 
   try {
-    JSON.parse(repaired)
+    const parsed = JSON.parse(repaired)
+    if (typeof parsed === "object" && parsed !== null && Object.keys(parsed).length === 0 && trimmed.length <= 2) return undefined
+    log.info("repaired JSON by closing truncated structure", { tool: toolName })
     return repaired
   } catch {}
 
